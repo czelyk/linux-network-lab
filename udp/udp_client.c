@@ -17,6 +17,9 @@ int main(void)
     struct sockaddr_in server_addr;
     const char *message = "merhaba";
     ssize_t sent_bytes;
+    struct sockaddr_in local_addr;
+    socklen_t local_addr_len;
+    unsigned short local_port;
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -55,6 +58,21 @@ int main(void)
         close(sockfd);
         return EXIT_FAILURE;
     }
+
+    local_addr_len = sizeof(local_addr);
+
+    if(getsockname(sockfd,
+                    (struct sockaddr *)&local_addr,
+                    &local_addr_len) < 0)
+    {
+        perror("getsockname");
+        close(sockfd);
+        return EXIT_FAILURE;
+    }
+
+    local_port = nthos(local_addr.sin_port);
+
+    printf("Client local port: %u\n", local_port);
 
     printf("Sent %zd bytes to %s:%d\n",
             sent_bytes,
