@@ -62,5 +62,8 @@ int main(void)
             SERVER_PORT);
 
     close(sockfd);
+
+    printf("Press Enter to close socket...\n");
+    getchar();
     return 0;
 }
