@@ -13,14 +13,19 @@
 int main(void)
 {
     int sockfd;
+
     struct sockaddr_in server_addr;
-    char buffer[BUFFER_SIZE];
 
     struct sockaddr_in client_addr;
     socklen_t client_addr_len;
+    unsigned short client_port;
+    char client_ip[INET_ADDRSTRLEN];
+
+    char buffer[BUFFER_SIZE];
     ssize_t received_bytes;
 
-    unsigned short client_port;
+    const char *reply = "zdravo client";
+    ssize_t sent_bytes;
 
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -46,12 +51,13 @@ int main(void)
     }
 
     printf("UDP server listening on port %d...\n", PORT);
-    client_addr_len=sizeof(client_addr);
+
+    client_addr_len = sizeof(client_addr);
 
     received_bytes = recvfrom(
         sockfd,
         buffer,
-        sizeof(buffer) -1,
+        sizeof(buffer) - 1,
         0,
         (struct sockaddr *)&client_addr,
         &client_addr_len
@@ -66,16 +72,12 @@ int main(void)
 
     buffer[received_bytes] = '\0';
 
-
     client_port = ntohs(client_addr.sin_port);
 
-
-    char client_ip[INET_ADDRSTRLEN];
-
     if(inet_ntop(AF_INET,
-                &client_addr.sin_addr,
-                client_ip,
-                sizeof(client_ip)) == NULL)
+                 &client_addr.sin_addr,
+                 client_ip,
+                 sizeof(client_ip)) == NULL)
     {
         perror("inet_ntop");
         close(sockfd);
@@ -83,12 +85,33 @@ int main(void)
     }
 
     printf("Received %zd bytes from %s:%u: %s\n",
-        received_bytes,
-        client_ip,
-        client_port,
-        buffer);
+           received_bytes,
+           client_ip,
+           client_port,
+           buffer);
+
+    sent_bytes = sendto(
+        sockfd,
+        reply,
+        strlen(reply),
+        0,
+        (struct sockaddr *)&client_addr,
+        client_addr_len
+    );
+
+    if(sent_bytes < 0)
+    {
+        perror("sendto");
+        close(sockfd);
+        return EXIT_FAILURE;
+    }
+
+    printf("Sent %zd bytes back to %s:%u\n",
+           sent_bytes,
+           client_ip,
+           client_port);
 
     close(sockfd);
 
     return 0;
-}
+}   
