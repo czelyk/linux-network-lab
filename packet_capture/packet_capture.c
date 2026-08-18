@@ -7,9 +7,10 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <net/ethernet.h>
-
-#include <netinet/tcp.h>
+#include <linux/tcp.h>
 #include <netinet/udp.h>
+
+#include <arpa/inet.h>
 
 #define BUFFER_SIZE 65536
 
@@ -18,6 +19,7 @@ int main(void)
     int sockfd;
     unsigned char buffer[BUFFER_SIZE];
     unsigned int ip_header_len;
+    unsigned char tcp_flags;
 
     ssize_t received_bytes;
     struct ethhdr *eth;
@@ -132,8 +134,46 @@ int main(void)
         {
             printf("TCP packet detected\n");
 
-            ///////tcp
-            
+            tcp = (struct tcphdr *)
+                    (buffer + 
+                    sizeof(struct ethhdr) +
+                    ip_header_len);
+
+            tcp_flags = *((unsigned char *)tcp + 13);
+
+            printf("Source port: %u\n",
+                    ntohs(tcp->source));
+
+            printf("Destination port: %u\n",
+                    ntohs(tcp->dest));
+
+            printf("TCP Flags:\n");
+
+            printf("  FIN: %u\n", !!(tcp_flags & 0x01));
+            printf("  SYN: %u\n", !!(tcp_flags & 0x02));
+            printf("  RST: %u\n", !!(tcp_flags & 0x04));
+            printf("  PSH: %u\n", !!(tcp_flags & 0x08));
+            printf("  ACK: %u\n", !!(tcp_flags & 0x10));
+            printf("  URG: %u\n", !!(tcp_flags & 0x20));
+        }
+        else if(ip->protocol == IPPROTO_UDP)
+        {
+            printf("UDP packet detected\n");
+
+            udp = (struct udphdr *)
+                    (buffer +
+                    sizeof(struct ethhdr) +
+                    ip_header_len);
+
+            printf("Source port: %u\n",
+                    ntohs(udp->dest));
+
+            printf("Destinations port: %u\n",
+                    ntohs(udp->dest));
+        }
+        else if(ip->protocol == IPPROTO_ICMP)
+        {
+            printf("ICMP packet detected\n");
         }
     }
 
