@@ -5,6 +5,96 @@
 
 static struct net_device *my_dev;
 
+
+/*
+ * Interface UP olduğunda kernel bu fonksiyonu çağırır.
+ */
+static int my_open(struct net_device *dev)
+{
+    pr_info("simple_netdev: %s opened\n", dev->name);
+
+    netif_start_queue(dev);
+
+    return 0;
+}
+
+
+/*
+ * Interface DOWN olduğunda kernel bu fonksiyonu çağırır.
+ */
+static int my_stop(struct net_device *dev)
+{
+    pr_info("simple_netdev: %s stopped\n", dev->name);
+
+    netif_stop_queue(dev);
+
+    return 0;
+}
+
+static netdev_tx_t my_start_xmit(
+    struct sk_buff *skb,
+    struct net_device *dev)
+{
+    pr_info(
+        "simple_netdev: transmitting packet on %s, len=%u\n",
+        dev->name,
+        skb->len
+    );
+
+    /*
+     * Bu sanal örnekte gerçek hardware olmadığı için
+     * packet'ı NIC'e göndermiyoruz.
+     *
+     * Packet'ı tüketip serbest bırakıyoruz.
+     */
+    dev_kfree_skb(skb);
+
+    return NETDEV_TX_OK;
+}
+
+static int my_change_mtu(
+    struct net_device *dev,
+    int new_mtu)
+{
+    pr_info(
+        "simple_netdev: %s MTU change: %u -> %d\n",
+        dev->name,
+        dev->mtu,
+        new_mtu
+    );
+
+    if(new_mtu < 68 || new_mtu > 9000)
+    {
+        pr_err(
+            "simple_netdev: invalid MTU: %d\n",
+            new_mtu
+        );
+
+        return -EINVAL;
+    }
+
+    dev->mtu = new_mtu;
+
+    return 0;
+}
+
+
+/*
+ * Network device operasyonları.
+ *
+ * Kernel:
+ *
+ * interface UP   -> ndo_open
+ * interface DOWN -> ndo_stop
+ */
+static const struct net_device_ops my_netdev_ops = {
+    .ndo_open = my_open,
+    .ndo_stop = my_stop,
+    .ndo_start_xmit = my_start_xmit,
+    .ndo_change_mtu = my_change_mtu,
+};
+
+
 static int __init simple_netdev_init(void)
 {
     int ret;
@@ -13,7 +103,7 @@ static int __init simple_netdev_init(void)
 
     if(my_dev == NULL)
     {
-        pr_err("Simple_netdev: alloc_etherdev failed\n");
+        pr_err("simple_netdev: alloc_etherdev failed\n");
         return -ENOMEM;
     }
 
@@ -23,11 +113,17 @@ static int __init simple_netdev_init(void)
         IFNAMSIZ
     );
 
+    /*
+     * Bizim callback tablomuzu
+     * net_device'a bağlıyoruz.
+     */
+    my_dev->netdev_ops = &my_netdev_ops;
+
     ret = register_netdev(my_dev);
-    
+
     if(ret < 0)
     {
-        pr_err("Simple_netdev: register_netdev failed\n");
+        pr_err("simple_netdev: register_netdev failed\n");
 
         free_netdev(my_dev);
         return ret;
@@ -35,11 +131,12 @@ static int __init simple_netdev_init(void)
 
     pr_info(
         "simple_netdev: registered interface %s\n",
-            my_dev->name
+        my_dev->name
     );
 
     return 0;
 }
+
 
 static void __exit simple_netdev_exit(void)
 {
@@ -48,6 +145,7 @@ static void __exit simple_netdev_exit(void)
 
     pr_info("simple_netdev: module unloaded\n");
 }
+
 
 module_init(simple_netdev_init);
 module_exit(simple_netdev_exit);
