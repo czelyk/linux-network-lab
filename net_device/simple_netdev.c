@@ -31,22 +31,59 @@ static int my_stop(struct net_device *dev)
     return 0;
 }
 
-static netdev_tx_t my_start_xmit(
+static void my_receive(
     struct sk_buff *skb,
     struct net_device *dev)
 {
+    skb->dev = dev;
+
+    skb->protocol = eth_type_trans(
+        skb,
+        dev
+    );
+
+    skb->ip_summed = CHECKSUM_NONE;
+
     pr_info(
-        "simple_netdev: transmitting packet on %s, len=%u\n",
+        "simple_netdev: RX packet on %s, len=%u\n",
         dev->name,
         skb->len
     );
 
-    /*
-     * Bu sanal örnekte gerçek hardware olmadığı için
-     * packet'ı NIC'e göndermiyoruz.
-     *
-     * Packet'ı tüketip serbest bırakıyoruz.
-     */
+    netif_rx(skb);
+}
+
+sstatic netdev_tx_t my_start_xmit(
+    struct sk_buff *skb,
+    struct net_device *dev)
+{
+    struct sk_buff *rx_skb;
+
+    pr_info(
+        "simple_netdev: TX packet on %s, len=%u\n",
+        dev->name,
+        skb->len
+    );
+
+    rx_skb = skb_clone(
+        skb,
+        GFP_ATOMIC
+    );
+
+    if(rx_skb != NULL)
+    {
+        my_receive(
+            rx_skb,
+            dev
+        );
+    }
+    else
+    {
+        pr_err(
+            "simple_netdev: skb_clone failed\n"
+        );
+    }
+
     dev_kfree_skb(skb);
 
     return NETDEV_TX_OK;
