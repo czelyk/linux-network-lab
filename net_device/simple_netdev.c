@@ -3,7 +3,27 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 
+#define RX_RING_SIZE 64
+#define RX_BUFFER_SIZE 2048
+
 static struct net_device *my_dev;
+
+struct my_rx_desc
+{
+    void *buf;
+    dma_addr_t dma_addr;
+    unsigned int len;
+    bool done;
+};
+
+struct my_priv
+{
+    struct napi_struct napi;
+
+    struct my_rx_desc rx_ring[RX_RING_SIZE];
+
+    unsigned int rx_head;
+}
 
 
 /*
@@ -172,6 +192,144 @@ static int __init simple_netdev_init(void)
     );
 
     return 0;
+}
+
+static int my_alloc_rx_ring(
+    struct net_device *dev)
+{
+    struct my_priv *priv;
+    int i;
+
+    priv = netdev_pring(dev);
+
+    for(i = 0; i < RX_RING_SIZE; i++)
+    {
+        priv->rx_ring[i].buf = 
+            kmalloc(
+                RX_BUF_SIZE,
+                GFP_KERNEL
+            );
+        if(priv->rx_ring[i].buf == NULL)
+            return -ENOMEM;
+
+        priv->rx_ring[i].dma_addr =
+            dma_map_single(
+                dev->dev.parent,
+                prix->rx_ring[i].buf,
+                RX_BUF_SIZE,
+                DMA_FROM_DEVICE
+            );
+
+        if(dma_mapping_error(
+            dev->dev.parent,
+            prix->rx_ring[i].dma_addr))
+        {
+            kfree(priv->rx_ring[i].buf);
+            return -EIO;
+        }
+
+        priv->rx_ring[i].len = 0;
+        priv->rx_ring[i].done = false;
+        
+    }
+    priv->rx_head = 0;
+
+    return 0;
+}
+
+
+static int my_poll(
+    struct napi_struct *napi,
+    int budget)
+{
+    struct my_priv *priv;
+    struct net_device *dev;
+    struct my_rx_desc *desc;
+    struct sk_buff *skb;
+
+    int work_done = 0;
+
+    priv = container_of(
+        napi,
+        struct my_priv,
+        napi
+    );
+
+    dev = napi->dev;
+
+    while(work_done < budget)
+    {
+        desc = &priv->rx_ring[priv->rx_head];
+
+        if(!desc->done)
+            break;
+
+        dma_sync_single_for_cpu(
+            dev->dev.parent,
+            desc->dma_addr,
+            desc->len,
+            DMA_FROM_DEVICE
+        );
+
+        skb = netdev_alloc_skb(
+            dev,
+            desc->len
+        );
+
+        if(skb != NULL)
+        {
+            memcpy(
+                
+                skb_put(skb, desc->len),
+                desc->buf,
+                desc->len
+            );
+
+        skb->dev = dev;
+
+        skb->protocol =
+            eth_type_trans(
+                skb,
+                dev
+            );
+
+        skb->ip_summed = 
+            CHECKSUM_NONE;
+
+        netif_received_skb(skb);
+    }
+
+    desc->done = false;
+    desc->len = 0;
+
+    dma_sync_single_for_device(
+            dev->dev.parent,
+            desc->dma_addr,
+            RX_BUF_SIZE,
+            DMA_FROM_DEVICE
+        );
+
+        priv->rx_head =
+            (priv->rx_head + 1)
+            % RX_RING_SIZE;
+
+        work_done++;
+    }
+
+    if(work_done < budget)
+    {
+        napi_complete_done(
+            napi,
+            work_done
+        );
+
+        /*
+         * Gerçek driver:
+         * RX interrupt tekrar enable
+         */
+    }
+
+    return work_done;
 }
 
 

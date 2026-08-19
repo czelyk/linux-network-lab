@@ -238,7 +238,7 @@ int main(void)
         reply_buffer[received_bytes] = '\0';
 
         printf("Received %zd bytes from server: %s\n",
-               received_bytes,
+               received_bytes,  
                reply_buffer);
     }
 
