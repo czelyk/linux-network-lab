@@ -6,18 +6,21 @@
 #include <fcntl.h>
 
 #include <sys/socket.h>
-#include <sys/poll.h>
+#include <sys/epoll.h>
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
 
 #define LISTEN_PORT 5001
-#define SERVER_PORT 6000
-#define SERVER_IP   "127.0.0.1"
 
-#define SOCKET_BUFFER_SIZE   (4 * 1024 * 1024)
-#define FORWARD_BUFFER_SIZE  (64 * 1024)
+#define SERVER_IP   "127.0.0.1"
+#define SERVER_PORT 6000
+
+#define MAX_EVENTS 1024
+
+#define FORWARD_BUFFER_SIZE (64 * 1024)
+#define SOCKET_BUFFER_SIZE  (4 * 1024 * 1024)
 
 
 struct io_buffer
@@ -28,6 +31,49 @@ struct io_buffer
     size_t end;
 };
 
+
+struct connection;
+
+
+enum endpoint_type
+{
+    ENDPOINT_LISTENER,
+    ENDPOINT_CLIENT,
+    ENDPOINT_SERVER
+};
+
+
+struct endpoint
+{
+    int fd;
+
+    enum endpoint_type type;
+
+    struct connection *conn;
+};
+
+
+struct connection
+{
+    struct endpoint client;
+    struct endpoint server;
+
+    struct io_buffer c2s;
+    struct io_buffer s2c;
+
+    int client_read_open;
+    int server_read_open;
+
+    int client_write_closed;
+    int server_write_closed;
+};
+
+
+/*
+ * ------------------------------------------------------------
+ * NON-BLOCKING
+ * ------------------------------------------------------------
+ */
 
 static int set_nonblocking(int fd)
 {
@@ -45,6 +91,7 @@ static int set_nonblocking(int fd)
         return -1;
     }
 
+
     if(fcntl(
             fd,
             F_SETFL,
@@ -54,15 +101,23 @@ static int set_nonblocking(int fd)
         return -1;
     }
 
+
     return 0;
 }
 
+
+/*
+ * ------------------------------------------------------------
+ * SOCKET BUFFER TUNING
+ * ------------------------------------------------------------
+ */
 
 static int tune_socket_buffers(int fd)
 {
     int size;
 
     size = SOCKET_BUFFER_SIZE;
+
 
     if(setsockopt(
             fd,
@@ -75,6 +130,7 @@ static int tune_socket_buffers(int fd)
         return -1;
     }
 
+
     if(setsockopt(
             fd,
             SOL_SOCKET,
@@ -86,9 +142,16 @@ static int tune_socket_buffers(int fd)
         return -1;
     }
 
+
     return 0;
 }
 
+
+/*
+ * ------------------------------------------------------------
+ * BUFFER HELPERS
+ * ------------------------------------------------------------
+ */
 
 static int buffer_empty(
     const struct io_buffer *buf)
@@ -130,7 +193,9 @@ static void buffer_compact(
     if(buf->start == 0)
         return;
 
+
     pending = buffer_pending(buf);
+
 
     if(pending > 0)
     {
@@ -141,10 +206,151 @@ static void buffer_compact(
         );
     }
 
+
     buf->start = 0;
     buf->end = pending;
 }
 
+
+/*
+ * ------------------------------------------------------------
+ * EPOLL HELPER
+ * ------------------------------------------------------------
+ */
+
+static int epoll_modify(
+    int epoll_fd,
+    struct endpoint *endpoint,
+    uint32_t events)
+{
+    struct epoll_event ev;
+
+    memset(
+        &ev,
+        0,
+        sizeof(ev)
+    );
+
+
+    ev.events = events;
+    ev.data.ptr = endpoint;
+
+
+    if(epoll_ctl(
+            epoll_fd,
+            EPOLL_CTL_MOD,
+            endpoint->fd,
+            &ev) < 0)
+    {
+        perror("epoll_ctl MOD");
+        return -1;
+    }
+
+
+    return 0;
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * CALCULATE EPOLL EVENTS
+ * ------------------------------------------------------------
+ */
+
+static int update_connection_events(
+    int epoll_fd,
+    struct connection *conn)
+{
+    uint32_t client_events;
+    uint32_t server_events;
+
+
+    client_events = 0;
+    server_events = 0;
+
+
+    /*
+     * Client'tan okuyabilir miyiz?
+     *
+     * c2s buffer'da yer varsa EPOLLIN iste.
+     */
+    if(conn->client_read_open)
+    {
+        if(buffer_space(&conn->c2s) > 0 ||
+           conn->c2s.start > 0)
+        {
+            client_events |= EPOLLIN;
+        }
+    }
+
+
+    /*
+     * Server'dan okuyabilir miyiz?
+     */
+    if(conn->server_read_open)
+    {
+        if(buffer_space(&conn->s2c) > 0 ||
+           conn->s2c.start > 0)
+        {
+            server_events |= EPOLLIN;
+        }
+    }
+
+
+    /*
+     * Server'a gönderilecek pending data varsa
+     * server fd için EPOLLOUT iste.
+     */
+    if(!buffer_empty(&conn->c2s))
+    {
+        server_events |= EPOLLOUT;
+    }
+
+
+    /*
+     * Client'a gönderilecek pending data varsa
+     * client fd için EPOLLOUT iste.
+     */
+    if(!buffer_empty(&conn->s2c))
+    {
+        client_events |= EPOLLOUT;
+    }
+
+
+    /*
+     * Connection kapanmalarını da görmek istiyoruz.
+     */
+    client_events |= EPOLLRDHUP;
+    server_events |= EPOLLRDHUP;
+
+
+    if(epoll_modify(
+            epoll_fd,
+            &conn->client,
+            client_events) < 0)
+    {
+        return -1;
+    }
+
+
+    if(epoll_modify(
+            epoll_fd,
+            &conn->server,
+            server_events) < 0)
+    {
+        return -1;
+    }
+
+
+    return 0;
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * READ INTO FORWARD BUFFER
+ * ------------------------------------------------------------
+ */
 
 static int receive_into_buffer(
     int fd,
@@ -154,27 +360,28 @@ static int receive_into_buffer(
     ssize_t n;
     size_t space;
 
-    /*
-     * Eğer buffer'ın sonunda yer kalmadıysa ama
-     * baş tarafında gönderilmiş data nedeniyle boşluk varsa
-     * compact etmeyi dene.
-     */
+
     if(buffer_space(buf) == 0 &&
        buf->start > 0)
     {
         buffer_compact(buf);
     }
 
+
     space = buffer_space(buf);
 
-    /*
-     * Userspace queue tamamen dolu.
-     *
-     * Bu durumda artık recv() yapmıyoruz.
-     * Böylece TCP backpressure doğal şekilde oluşacak.
-     */
+
     if(space == 0)
+    {
+        /*
+         * Backpressure.
+         *
+         * Userspace queue dolu.
+         * recv() yapmıyoruz.
+         */
         return 0;
+    }
+
 
     n = recv(
         fd,
@@ -183,9 +390,11 @@ static int receive_into_buffer(
         0
     );
 
+
     if(n > 0)
     {
         buf->end += (size_t)n;
+
 
         printf(
             "%s: received %zd bytes, pending=%zu\n",
@@ -194,18 +403,19 @@ static int receive_into_buffer(
             buffer_pending(buf)
         );
 
+
         return 1;
     }
 
+
     if(n == 0)
     {
-        printf(
-            "%s: peer performed orderly shutdown\n",
-            name
-        );
-
+        /*
+         * FIN / orderly shutdown.
+         */
         return 2;
     }
+
 
     if(errno == EAGAIN ||
        errno == EWOULDBLOCK)
@@ -213,16 +423,24 @@ static int receive_into_buffer(
         return 0;
     }
 
+
     if(errno == EINTR)
     {
         return 0;
     }
+
 
     perror(name);
 
     return -1;
 }
 
+
+/*
+ * ------------------------------------------------------------
+ * FLUSH FORWARD BUFFER
+ * ------------------------------------------------------------
+ */
 
 static int flush_buffer(
     int fd,
@@ -232,21 +450,26 @@ static int flush_buffer(
     ssize_t n;
     size_t pending;
 
+
     if(buffer_empty(buf))
         return 0;
 
+
     pending = buffer_pending(buf);
+
 
     n = send(
         fd,
         buf->data + buf->start,
         pending,
-        0
+        MSG_NOSIGNAL
     );
+
 
     if(n > 0)
     {
         buf->start += (size_t)n;
+
 
         printf(
             "%s: sent %zd bytes, remaining=%zu\n",
@@ -255,15 +478,17 @@ static int flush_buffer(
             buffer_pending(buf)
         );
 
+
         buffer_reset_if_empty(buf);
+
 
         return 1;
     }
 
+
     if(n == 0)
-    {
         return 0;
-    }
+
 
     if(errno == EAGAIN ||
        errno == EWOULDBLOCK)
@@ -271,10 +496,12 @@ static int flush_buffer(
         return 0;
     }
 
+
     if(errno == EINTR)
     {
         return 0;
     }
+
 
     perror(name);
 
@@ -282,54 +509,566 @@ static int flush_buffer(
 }
 
 
+/*
+ * ------------------------------------------------------------
+ * DESTROY CONNECTION
+ * ------------------------------------------------------------
+ */
+
+static void destroy_connection(
+    int epoll_fd,
+    struct connection *conn)
+{
+    if(conn == NULL)
+        return;
+
+
+    printf(
+        "Destroying connection client_fd=%d server_fd=%d\n",
+        conn->client.fd,
+        conn->server.fd
+    );
+
+
+    if(conn->client.fd >= 0)
+    {
+        epoll_ctl(
+            epoll_fd,
+            EPOLL_CTL_DEL,
+            conn->client.fd,
+            NULL
+        );
+
+        close(conn->client.fd);
+    }
+
+
+    if(conn->server.fd >= 0)
+    {
+        epoll_ctl(
+            epoll_fd,
+            EPOLL_CTL_DEL,
+            conn->server.fd,
+            NULL
+        );
+
+        close(conn->server.fd);
+    }
+
+
+    free(conn);
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * CREATE SERVER-SIDE CONNECTION
+ * ------------------------------------------------------------
+ */
+
+static int create_remote_socket(void)
+{
+    int fd;
+
+    struct sockaddr_in server_addr;
+
+
+    fd = socket(
+        AF_INET,
+        SOCK_STREAM,
+        0
+    );
+
+
+    if(fd < 0)
+    {
+        perror("socket remote");
+        return -1;
+    }
+
+
+    if(tune_socket_buffers(fd) < 0)
+    {
+        close(fd);
+        return -1;
+    }
+
+
+    memset(
+        &server_addr,
+        0,
+        sizeof(server_addr)
+    );
+
+
+    server_addr.sin_family =
+        AF_INET;
+
+    server_addr.sin_port =
+        htons(SERVER_PORT);
+
+
+    if(inet_pton(
+            AF_INET,
+            SERVER_IP,
+            &server_addr.sin_addr) != 1)
+    {
+        fprintf(
+            stderr,
+            "Invalid server IP\n"
+        );
+
+        close(fd);
+
+        return -1;
+    }
+
+
+    /*
+     * Şimdilik connect() blocking.
+     *
+     * Bir sonraki gelişmiş sürümde bunu da
+     * non-blocking connect yapabiliriz.
+     */
+    if(connect(
+            fd,
+            (struct sockaddr *)&server_addr,
+            sizeof(server_addr)) < 0)
+    {
+        perror("connect remote");
+
+        close(fd);
+
+        return -1;
+    }
+
+
+    if(set_nonblocking(fd) < 0)
+    {
+        close(fd);
+        return -1;
+    }
+
+
+    return fd;
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * CREATE CONNECTION OBJECT
+ * ------------------------------------------------------------
+ */
+
+static struct connection *create_connection(
+    int epoll_fd,
+    int client_fd)
+{
+    struct connection *conn;
+
+    struct epoll_event ev;
+
+    int server_fd;
+
+
+    server_fd = create_remote_socket();
+
+    if(server_fd < 0)
+    {
+        close(client_fd);
+        return NULL;
+    }
+
+
+    if(tune_socket_buffers(client_fd) < 0)
+    {
+        close(server_fd);
+        close(client_fd);
+        return NULL;
+    }
+
+
+    if(set_nonblocking(client_fd) < 0)
+    {
+        close(server_fd);
+        close(client_fd);
+        return NULL;
+    }
+
+
+    conn = calloc(
+        1,
+        sizeof(*conn)
+    );
+
+
+    if(conn == NULL)
+    {
+        perror("calloc connection");
+
+        close(server_fd);
+        close(client_fd);
+
+        return NULL;
+    }
+
+
+    conn->client.fd =
+        client_fd;
+
+    conn->client.type =
+        ENDPOINT_CLIENT;
+
+    conn->client.conn =
+        conn;
+
+
+    conn->server.fd =
+        server_fd;
+
+    conn->server.type =
+        ENDPOINT_SERVER;
+
+    conn->server.conn =
+        conn;
+
+
+    conn->client_read_open = 1;
+    conn->server_read_open = 1;
+
+    conn->client_write_closed = 0;
+    conn->server_write_closed = 0;
+
+
+    /*
+     * Client endpoint'i epoll'a ekle.
+     */
+    memset(
+        &ev,
+        0,
+        sizeof(ev)
+    );
+
+
+    ev.events =
+        EPOLLIN |
+        EPOLLRDHUP;
+
+    ev.data.ptr =
+        &conn->client;
+
+
+    if(epoll_ctl(
+            epoll_fd,
+            EPOLL_CTL_ADD,
+            client_fd,
+            &ev) < 0)
+    {
+        perror("epoll_ctl ADD client");
+
+        destroy_connection(
+            epoll_fd,
+            conn
+        );
+
+        return NULL;
+    }
+
+
+    /*
+     * Server endpoint'i epoll'a ekle.
+     */
+    memset(
+        &ev,
+        0,
+        sizeof(ev)
+    );
+
+
+    ev.events =
+        EPOLLIN |
+        EPOLLRDHUP;
+
+    ev.data.ptr =
+        &conn->server;
+
+
+    if(epoll_ctl(
+            epoll_fd,
+            EPOLL_CTL_ADD,
+            server_fd,
+            &ev) < 0)
+    {
+        perror("epoll_ctl ADD server");
+
+        destroy_connection(
+            epoll_fd,
+            conn
+        );
+
+        return NULL;
+    }
+
+
+    printf(
+        "New split connection: client_fd=%d server_fd=%d\n",
+        client_fd,
+        server_fd
+    );
+
+
+    return conn;
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * PROCESS CLIENT ENDPOINT EVENT
+ * ------------------------------------------------------------
+ */
+
+static int process_client_event(
+    int epoll_fd,
+    struct connection *conn,
+    uint32_t events)
+{
+    /*
+     * CLIENT -> ACCELERATOR
+     */
+    if(events & EPOLLIN)
+    {
+        int result;
+
+
+        result = receive_into_buffer(
+            conn->client.fd,
+            &conn->c2s,
+            "client recv"
+        );
+
+
+        if(result < 0)
+            return -1;
+
+
+        if(result == 2)
+        {
+            conn->client_read_open = 0;
+        }
+    }
+
+
+    /*
+     * ACCELERATOR -> CLIENT
+     */
+    if(events & EPOLLOUT)
+    {
+        if(flush_buffer(
+                conn->client.fd,
+                &conn->s2c,
+                "client send") < 0)
+        {
+            return -1;
+        }
+    }
+
+
+    if(events &
+       (EPOLLERR | EPOLLHUP))
+    {
+        return -1;
+    }
+
+
+    /*
+     * Client FIN gönderdi.
+     */
+    if(events & EPOLLRDHUP)
+    {
+        conn->client_read_open = 0;
+    }
+
+
+    /*
+     * Client'tan alınmış bütün data Server'a
+     * iletildiyse Server tarafında FIN üret.
+     */
+    if(!conn->client_read_open &&
+       buffer_empty(&conn->c2s) &&
+       !conn->server_write_closed)
+    {
+        shutdown(
+            conn->server.fd,
+            SHUT_WR
+        );
+
+        conn->server_write_closed = 1;
+    }
+
+
+    if(update_connection_events(
+            epoll_fd,
+            conn) < 0)
+    {
+        return -1;
+    }
+
+
+    return 0;
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * PROCESS SERVER ENDPOINT EVENT
+ * ------------------------------------------------------------
+ */
+
+static int process_server_event(
+    int epoll_fd,
+    struct connection *conn,
+    uint32_t events)
+{
+    /*
+     * SERVER -> ACCELERATOR
+     */
+    if(events & EPOLLIN)
+    {
+        int result;
+
+
+        result = receive_into_buffer(
+            conn->server.fd,
+            &conn->s2c,
+            "server recv"
+        );
+
+
+        if(result < 0)
+            return -1;
+
+
+        if(result == 2)
+        {
+            conn->server_read_open = 0;
+        }
+    }
+
+
+    /*
+     * ACCELERATOR -> SERVER
+     */
+    if(events & EPOLLOUT)
+    {
+        if(flush_buffer(
+                conn->server.fd,
+                &conn->c2s,
+                "server send") < 0)
+        {
+            return -1;
+        }
+    }
+
+
+    if(events &
+       (EPOLLERR | EPOLLHUP))
+    {
+        return -1;
+    }
+
+
+    /*
+     * Server FIN göndermiş.
+     */
+    if(events & EPOLLRDHUP)
+    {
+        conn->server_read_open = 0;
+    }
+
+
+    /*
+     * Server'dan alınan bütün data Client'a
+     * iletildiyse Client tarafında FIN üret.
+     */
+    if(!conn->server_read_open &&
+       buffer_empty(&conn->s2c) &&
+       !conn->client_write_closed)
+    {
+        shutdown(
+            conn->client.fd,
+            SHUT_WR
+        );
+
+        conn->client_write_closed = 1;
+    }
+
+
+    if(update_connection_events(
+            epoll_fd,
+            conn) < 0)
+    {
+        return -1;
+    }
+
+
+    return 0;
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * CONNECTION FINISHED?
+ * ------------------------------------------------------------
+ */
+
+static int connection_finished(
+    const struct connection *conn)
+{
+    return
+        !conn->client_read_open &&
+        !conn->server_read_open &&
+        buffer_empty(&conn->c2s) &&
+        buffer_empty(&conn->s2c);
+}
+
+
+/*
+ * ------------------------------------------------------------
+ * MAIN
+ * ------------------------------------------------------------
+ */
+
 int main(void)
 {
     int listen_fd;
-    int client_fd;
-    int server_fd;
+    int epoll_fd;
 
     int yes;
 
-    int client_read_open;
-    int server_read_open;
+    struct sockaddr_in listen_addr;
 
-    struct sockaddr_in accelerator_addr;
-    struct sockaddr_in server_addr;
+    struct epoll_event ev;
 
-    struct pollfd fds[2];
+    struct epoll_event events[MAX_EVENTS];
 
-    struct io_buffer c2s;
-    struct io_buffer s2c;
+    struct endpoint listener_endpoint;
 
 
     yes = 1;
 
-    client_read_open = 1;
-    server_read_open = 1;
-
-    memset(
-        &c2s,
-        0,
-        sizeof(c2s)
-    );
-
-    memset(
-        &s2c,
-        0,
-        sizeof(s2c)
-    );
-
 
     /*
-     * --------------------------------------------------
-     * 1. Listening socket
-     * --------------------------------------------------
+     * ============================================================
+     * LISTEN SOCKET
+     * ============================================================
      */
+
     listen_fd = socket(
         AF_INET,
         SOCK_STREAM,
         0
     );
+
 
     if(listen_fd < 0)
     {
@@ -353,26 +1092,34 @@ int main(void)
     }
 
 
+    if(set_nonblocking(listen_fd) < 0)
+    {
+        close(listen_fd);
+        return EXIT_FAILURE;
+    }
+
+
     memset(
-        &accelerator_addr,
+        &listen_addr,
         0,
-        sizeof(accelerator_addr)
+        sizeof(listen_addr)
     );
 
-    accelerator_addr.sin_family =
+
+    listen_addr.sin_family =
         AF_INET;
 
-    accelerator_addr.sin_addr.s_addr =
+    listen_addr.sin_addr.s_addr =
         htonl(INADDR_ANY);
 
-    accelerator_addr.sin_port =
+    listen_addr.sin_port =
         htons(LISTEN_PORT);
 
 
     if(bind(
             listen_fd,
-            (struct sockaddr *)&accelerator_addr,
-            sizeof(accelerator_addr)) < 0)
+            (struct sockaddr *)&listen_addr,
+            sizeof(listen_addr)) < 0)
     {
         perror("bind");
 
@@ -394,252 +1141,89 @@ int main(void)
     }
 
 
+    /*
+     * ============================================================
+     * EPOLL INSTANCE
+     * ============================================================
+     */
+
+    epoll_fd = epoll_create1(0);
+
+
+    if(epoll_fd < 0)
+    {
+        perror("epoll_create1");
+
+        close(listen_fd);
+
+        return EXIT_FAILURE;
+    }
+
+
+    /*
+     * Listener için endpoint wrapper.
+     */
+    listener_endpoint.fd =
+        listen_fd;
+
+    listener_endpoint.type =
+        ENDPOINT_LISTENER;
+
+    listener_endpoint.conn =
+        NULL;
+
+
+    memset(
+        &ev,
+        0,
+        sizeof(ev)
+    );
+
+
+    ev.events =
+        EPOLLIN;
+
+    ev.data.ptr =
+        &listener_endpoint;
+
+
+    if(epoll_ctl(
+            epoll_fd,
+            EPOLL_CTL_ADD,
+            listen_fd,
+            &ev) < 0)
+    {
+        perror("epoll_ctl ADD listener");
+
+        close(epoll_fd);
+        close(listen_fd);
+
+        return EXIT_FAILURE;
+    }
+
+
     printf(
-        "Accelerator listening on 0.0.0.0:%d\n",
+        "Multi-client TCP accelerator listening on 0.0.0.0:%d\n",
         LISTEN_PORT
     );
 
 
     /*
-     * --------------------------------------------------
-     * 2. Client accept
-     * --------------------------------------------------
+     * ============================================================
+     * MAIN EVENT LOOP
+     * ============================================================
      */
-    client_fd = accept(
-        listen_fd,
-        NULL,
-        NULL
-    );
 
-    if(client_fd < 0)
-    {
-        perror("accept");
-
-        close(listen_fd);
-
-        return EXIT_FAILURE;
-    }
-
-
-    printf(
-        "Client connected. client_fd=%d\n",
-        client_fd
-    );
-
-
-    if(tune_socket_buffers(client_fd) < 0)
-    {
-        close(client_fd);
-        close(listen_fd);
-
-        return EXIT_FAILURE;
-    }
-
-
-    /*
-     * --------------------------------------------------
-     * 3. Server-side socket
-     * --------------------------------------------------
-     */
-    server_fd = socket(
-        AF_INET,
-        SOCK_STREAM,
-        0
-    );
-
-    if(server_fd < 0)
-    {
-        perror("socket server");
-
-        close(client_fd);
-        close(listen_fd);
-
-        return EXIT_FAILURE;
-    }
-
-
-    if(tune_socket_buffers(server_fd) < 0)
-    {
-        close(server_fd);
-        close(client_fd);
-        close(listen_fd);
-
-        return EXIT_FAILURE;
-    }
-
-
-    memset(
-        &server_addr,
-        0,
-        sizeof(server_addr)
-    );
-
-    server_addr.sin_family =
-        AF_INET;
-
-    server_addr.sin_port =
-        htons(SERVER_PORT);
-
-
-    if(inet_pton(
-            AF_INET,
-            SERVER_IP,
-            &server_addr.sin_addr) != 1)
-    {
-        fprintf(
-            stderr,
-            "Invalid server IP: %s\n",
-            SERVER_IP
-        );
-
-        close(server_fd);
-        close(client_fd);
-        close(listen_fd);
-
-        return EXIT_FAILURE;
-    }
-
-
-    printf(
-        "Connecting to real server %s:%d...\n",
-        SERVER_IP,
-        SERVER_PORT
-    );
-
-
-    if(connect(
-            server_fd,
-            (struct sockaddr *)&server_addr,
-            sizeof(server_addr)) < 0)
-    {
-        perror("connect server");
-
-        close(server_fd);
-        close(client_fd);
-        close(listen_fd);
-
-        return EXIT_FAILURE;
-    }
-
-
-    printf(
-        "Connected to real server.\n"
-    );
-
-
-    /*
-     * connect() blocking olarak tamamlandıktan sonra
-     * iki connected socket'i non-blocking yapıyoruz.
-     */
-    if(set_nonblocking(client_fd) < 0)
-    {
-        close(server_fd);
-        close(client_fd);
-        close(listen_fd);
-
-        return EXIT_FAILURE;
-    }
-
-
-    if(set_nonblocking(server_fd) < 0)
-    {
-        close(server_fd);
-        close(client_fd);
-        close(listen_fd);
-
-        return EXIT_FAILURE;
-    }
-
-
-    /*
-     * --------------------------------------------------
-     * 4. poll setup
-     * --------------------------------------------------
-     */
-    memset(
-        fds,
-        0,
-        sizeof(fds)
-    );
-
-    fds[0].fd = client_fd;
-    fds[1].fd = server_fd;
-
-
-    printf(
-        "Non-blocking accelerator forwarding traffic...\n"
-    );
-
-
-    /*
-     * --------------------------------------------------
-     * 5. Event loop
-     * --------------------------------------------------
-     */
     while(1)
     {
         int ready;
+        int i;
 
 
-        /*
-         * Her iteration'da hangi event'lere ihtiyacımız
-         * olduğunu yeniden hesaplıyoruz.
-         */
-        fds[0].events = 0;
-        fds[1].events = 0;
-
-
-        /*
-         * Client'tan data okumak için c2s buffer'da
-         * boş yer olması gerekir.
-         */
-        if(client_read_open)
-        {
-            if(buffer_space(&c2s) > 0 ||
-               c2s.start > 0)
-            {
-                fds[0].events |= POLLIN;
-            }
-        }
-
-
-        /*
-         * Server'dan data okumak için s2c buffer'da
-         * boş yer olması gerekir.
-         */
-        if(server_read_open)
-        {
-            if(buffer_space(&s2c) > 0 ||
-               s2c.start > 0)
-            {
-                fds[1].events |= POLLIN;
-            }
-        }
-
-
-        /*
-         * Server'a gönderilecek data varsa
-         * server socket writable event'i iste.
-         */
-        if(!buffer_empty(&c2s))
-        {
-            fds[1].events |= POLLOUT;
-        }
-
-
-        /*
-         * Client'a gönderilecek data varsa
-         * client socket writable event'i iste.
-         */
-        if(!buffer_empty(&s2c))
-        {
-            fds[0].events |= POLLOUT;
-        }
-
-
-        ready = poll(
-            fds,
-            2,
+        ready = epoll_wait(
+            epoll_fd,
+            events,
+            MAX_EVENTS,
             -1
         );
 
@@ -649,204 +1233,137 @@ int main(void)
             if(errno == EINTR)
                 continue;
 
-            perror("poll");
-            break;
-        }
-
-
-        /*
-         * --------------------------------------------------
-         * CLIENT -> ACCELERATOR
-         * --------------------------------------------------
-         */
-        if(client_read_open &&
-           (fds[0].revents & POLLIN))
-        {
-            int result;
-
-            result = receive_into_buffer(
-                client_fd,
-                &c2s,
-                "client recv"
-            );
-
-            if(result < 0)
-            {
-                break;
-            }
-
-            if(result == 2)
-            {
-                client_read_open = 0;
-
-                /*
-                 * c2s buffer hemen boş olmak zorunda değil.
-                 *
-                 * Önce pending data server'a aktarılmalı.
-                 * FIN'i biraz sonra, buffer tamamen boşalınca
-                 * propagate edeceğiz.
-                 */
-            }
-        }
-
-
-        /*
-         * --------------------------------------------------
-         * SERVER -> ACCELERATOR
-         * --------------------------------------------------
-         */
-        if(server_read_open &&
-           (fds[1].revents & POLLIN))
-        {
-            int result;
-
-            result = receive_into_buffer(
-                server_fd,
-                &s2c,
-                "server recv"
-            );
-
-            if(result < 0)
-            {
-                break;
-            }
-
-            if(result == 2)
-            {
-                server_read_open = 0;
-            }
-        }
-
-
-        /*
-         * --------------------------------------------------
-         * ACCELERATOR -> SERVER
-         * --------------------------------------------------
-         */
-        if(fds[1].revents & POLLOUT)
-        {
-            if(flush_buffer(
-                    server_fd,
-                    &c2s,
-                    "server send") < 0)
-            {
-                break;
-            }
-        }
-
-
-        /*
-         * --------------------------------------------------
-         * ACCELERATOR -> CLIENT
-         * --------------------------------------------------
-         */
-        if(fds[0].revents & POLLOUT)
-        {
-            if(flush_buffer(
-                    client_fd,
-                    &s2c,
-                    "client send") < 0)
-            {
-                break;
-            }
-        }
-
-
-        /*
-         * --------------------------------------------------
-         * FIN propagation
-         * --------------------------------------------------
-         *
-         * Client FIN göndermişse ve client'tan alınmış
-         * bütün data server'a iletildiyse artık server_fd'nin
-         * write side'ını kapatabiliriz.
-         */
-        if(!client_read_open &&
-           buffer_empty(&c2s))
-        {
-            shutdown(
-                server_fd,
-                SHUT_WR
-            );
-        }
-
-
-        /*
-         * Server FIN göndermişse ve server'dan alınmış
-         * bütün data client'a iletildiyse client tarafında
-         * FIN oluştur.
-         */
-        if(!server_read_open &&
-           buffer_empty(&s2c))
-        {
-            shutdown(
-                client_fd,
-                SHUT_WR
-            );
-        }
-
-
-        /*
-         * --------------------------------------------------
-         * Error handling
-         * --------------------------------------------------
-         */
-        if(fds[0].revents &
-           (POLLERR | POLLNVAL))
-        {
-            fprintf(
-                stderr,
-                "Client socket error\n"
-            );
+            perror("epoll_wait");
 
             break;
         }
 
 
-        if(fds[1].revents &
-           (POLLERR | POLLNVAL))
+        for(i = 0; i < ready; i++)
         {
-            fprintf(
-                stderr,
-                "Server socket error\n"
-            );
-
-            break;
-        }
+            struct endpoint *endpoint;
 
 
-        /*
-         * --------------------------------------------------
-         * Connection completely finished?
-         * --------------------------------------------------
-         */
-        if(!client_read_open &&
-           !server_read_open &&
-           buffer_empty(&c2s) &&
-           buffer_empty(&s2c))
-        {
-            printf(
-                "Both directions completed.\n"
-            );
+            endpoint =
+                events[i].data.ptr;
 
-            break;
+
+            /*
+             * ----------------------------------------------------
+             * NEW CLIENT
+             * ----------------------------------------------------
+             */
+            if(endpoint->type ==
+               ENDPOINT_LISTENER)
+            {
+                while(1)
+                {
+                    int client_fd;
+
+
+                    client_fd = accept(
+                        listen_fd,
+                        NULL,
+                        NULL
+                    );
+
+
+                    if(client_fd < 0)
+                    {
+                        if(errno == EAGAIN ||
+                           errno == EWOULDBLOCK)
+                        {
+                            break;
+                        }
+
+
+                        if(errno == EINTR)
+                            continue;
+
+
+                        perror("accept");
+
+                        break;
+                    }
+
+
+                    create_connection(
+                        epoll_fd,
+                        client_fd
+                    );
+                }
+
+
+                continue;
+            }
+
+
+            /*
+             * Endpoint artık bir connection'a ait.
+             */
+            if(endpoint->conn == NULL)
+                continue;
+
+
+            /*
+             * Dikkat:
+             *
+             * process fonksiyonu connection'ı henüz free etmiyor.
+             * Önce event'i işliyoruz.
+             */
+            if(endpoint->type ==
+               ENDPOINT_CLIENT)
+            {
+                if(process_client_event(
+                        epoll_fd,
+                        endpoint->conn,
+                        events[i].events) < 0)
+                {
+                    destroy_connection(
+                        epoll_fd,
+                        endpoint->conn
+                    );
+
+                    continue;
+                }
+            }
+
+
+            else if(endpoint->type ==
+                    ENDPOINT_SERVER)
+            {
+                if(process_server_event(
+                        epoll_fd,
+                        endpoint->conn,
+                        events[i].events) < 0)
+                {
+                    destroy_connection(
+                        epoll_fd,
+                        endpoint->conn
+                    );
+
+                    continue;
+                }
+            }
+
+
+            /*
+             * İki yön de bitti mi?
+             */
+            if(connection_finished(
+                    endpoint->conn))
+            {
+                destroy_connection(
+                    epoll_fd,
+                    endpoint->conn
+                );
+            }
         }
     }
 
 
-    /*
-     * --------------------------------------------------
-     * 6. Cleanup
-     * --------------------------------------------------
-     */
-    close(server_fd);
-    close(client_fd);
+    close(epoll_fd);
     close(listen_fd);
-
-
-    printf(
-        "Accelerator stopped.\n"
-    );
 
 
     return EXIT_SUCCESS;
