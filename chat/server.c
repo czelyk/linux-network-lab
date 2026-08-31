@@ -16,7 +16,12 @@ int main(void)
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
-    memset_
+    memset(&server_addr, 0, sizeof(server_addr));
+
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
 
     if(server_fd < 0){
         perror("socket");
