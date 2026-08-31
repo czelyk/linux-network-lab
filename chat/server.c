@@ -16,6 +16,8 @@ int main(void)
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
+    memset_
+
     if(server_fd < 0){
         perror("socket");
         exit(EXIT_FAILURE);
