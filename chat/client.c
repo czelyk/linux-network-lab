@@ -47,6 +47,13 @@ int main(void)
         return 1;
     }
 
+
+    if(n == 0){
+        printf("Server disconnected.\n");
+        close(client_fd);
+        return 1;
+    }
+
     buffer[n] = '\0';
     printf("%s\n", buffer);
 
@@ -62,6 +69,37 @@ int main(void)
         perror("send");
         close(client_fd);
         return 1;
+    }
+
+    n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+
+
+    if(n < 0){
+        perror("recv");
+        close(client_fd);
+        return 1;
+    }
+
+    if(n ==0){
+        printf("Server disconnected.\n");
+        close(client_fd);
+        return 1;
+    }
+
+    buffer[n] = '\0';
+    printf("%s", buffer);
+
+    while(1){
+        printf("> ");
+
+        if(fgets(buffer, sizeof(buffer), stdin) == NULL){
+            break;
+        }
+
+        if(send(client_fd, buffer, strlen(buffer), 0) < 0){
+            perror("send");
+            break;
+        }
     }
 
     close(client_fd);
