@@ -15,6 +15,9 @@ int main(void)
 
     struct sockaddr_in server_addr;
 
+    char buffer[1024];
+    char username[32];
+
     client_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if(client_fd < 0){
@@ -35,6 +38,31 @@ int main(void)
     }
 
     printf("Connected to server.\n");
+
+    int n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+
+    if(n < 0){
+        perror("recv");
+        close(client_fd);
+        return 1;
+    }
+
+    buffer[n] = '\0';
+    printf("%s\n", buffer);
+
+    if(fgets(username, sizeof(username), stdin) == NULL){
+        perror("fgets");
+        close(client_fd);
+        return 1;
+    }
+
+    username[strcspn(username, "\n")] = '\0';
+
+    if(send(client_fd, username, strlen(username), 0) < 0){
+        perror("send");
+        close(client_fd);
+        return 1;
+    }
 
     close(client_fd);
 
