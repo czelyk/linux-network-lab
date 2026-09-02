@@ -9,7 +9,6 @@
 
 #define PORT 5001
 #define MAX_EVENTS 10
-
 #define MAX_CLIENTS 100
 
 struct Client {
@@ -17,6 +16,7 @@ struct Client {
     int user_id;
     char username[32];
     int active;
+    int logged_in;
 };
 
 int main(void)
@@ -32,16 +32,15 @@ int main(void)
 
     struct epoll_event event;
     struct epoll_event events[MAX_EVENTS];
+
     struct Client clients[MAX_CLIENTS];
 
     char client_ip[INET_ADDRSTRLEN];
-    char username[32];
     char response[128];
     char message[1024];
     char line[128];
 
-    int user_id;
-    int max_id;
+    memset(clients, 0, sizeof(clients));
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -94,8 +93,10 @@ int main(void)
         ) < 0) {
 
         perror("epoll_ctl");
+
         close(epoll_fd);
         close(server_fd);
+
         return 1;
     }
 
@@ -120,8 +121,8 @@ int main(void)
             int current_fd = events[i].data.fd;
 
             /*
-             * server_fd hazırsa:
-             * yeni TCP bağlantısı geliyor.
+             * Listening socket hazır:
+             * yeni TCP bağlantısı var.
              */
             if (current_fd == server_fd) {
 
@@ -151,6 +152,39 @@ int main(void)
                     ntohs(client_addr.sin_port)
                 );
 
+                /*
+                 * clients[] içinde boş slot bul.
+                 */
+                int client_index = -1;
+
+                for (int j = 0; j < MAX_CLIENTS; j++) {
+
+                    if (clients[j].active == 0) {
+                        client_index = j;
+                        break;
+                    }
+                }
+
+                if (client_index == -1) {
+
+                    printf("Maximum client limit reached.\n");
+
+                    close(client_fd);
+                    continue;
+                }
+
+                /*
+                 * Yeni bağlantının başlangıç state'i.
+                 */
+                clients[client_index].fd = client_fd;
+                clients[client_index].user_id = -1;
+                clients[client_index].username[0] = '\0';
+                clients[client_index].active = 1;
+                clients[client_index].logged_in = 0;
+
+                /*
+                 * Username iste.
+                 */
                 const char *prompt = "Enter your username: ";
 
                 if (send(
@@ -161,136 +195,17 @@ int main(void)
                     ) < 0) {
 
                     perror("send");
-                    close(client_fd);
-                    continue;
-                }
 
-                n = recv(
-                    client_fd,
-                    username,
-                    sizeof(username) - 1,
-                    0
-                );
-
-                if (n < 0) {
-                    perror("recv");
-                    close(client_fd);
-                    continue;
-                }
-
-                if (n == 0) {
-                    printf(
-                        "Client disconnected before sending username.\n"
-                    );
+                    clients[client_index].active = 0;
+                    clients[client_index].fd = -1;
 
                     close(client_fd);
+
                     continue;
                 }
-
-                username[n] = '\0';
-
-                printf(
-                    "Received username: %s\n",
-                    username
-                );
-
-                FILE *users_file = fopen(
-                    "users.db",
-                    "a+"
-                );
-
-                if (users_file == NULL) {
-                    perror("fopen");
-                    close(client_fd);
-                    continue;
-                }
-
-                user_id = -1;
-                max_id = 0;
-
-                rewind(users_file);
-
-                while (
-                    fgets(
-                        line,
-                        sizeof(line),
-                        users_file
-                    ) != NULL
-                ) {
-
-                    int file_id;
-                    char file_username[32];
-
-                    if (sscanf(
-                            line,
-                            "%d|%31s",
-                            &file_id,
-                            file_username
-                        ) == 2) {
-
-                        if (file_id > max_id) {
-                            max_id = file_id;
-                        }
-
-                        if (
-                            strcmp(
-                                file_username,
-                                username
-                            ) == 0
-                        ) {
-                            user_id = file_id;
-                        }
-                    }
-                }
-
-                if (user_id == -1) {
-
-                    user_id = max_id + 1;
-
-                    fprintf(
-                        users_file,
-                        "%d|%s\n",
-                        user_id,
-                        username
-                    );
-
-                    printf(
-                        "New user created. ID: %d\n",
-                        user_id
-                    );
-                }
-                else {
-
-                    printf(
-                        "Existing user found. ID: %d\n",
-                        user_id
-                    );
-                }
-
-                snprintf(
-                    response,
-                    sizeof(response),
-                    "Login successful. User ID: %d\n",
-                    user_id
-                );
-
-                if (send(
-                        client_fd,
-                        response,
-                        strlen(response),
-                        0
-                    ) < 0) {
-
-                    perror("send");
-                    fclose(users_file);
-                    close(client_fd);
-                    continue;
-                }
-
-                fclose(users_file);
 
                 /*
-                 * Artık bu client_fd'yi de epoll'a ekliyoruz.
+                 * Client socket'ini epoll'a ekle.
                  */
                 memset(&event, 0, sizeof(event));
 
@@ -305,22 +220,57 @@ int main(void)
                     ) < 0) {
 
                     perror("epoll_ctl client");
+
+                    clients[client_index].active = 0;
+                    clients[client_index].fd = -1;
+
                     close(client_fd);
+
                     continue;
                 }
 
                 printf(
-                    "Client fd %d added to epoll.\n",
+                    "Client fd %d added to epoll, waiting for username.\n",
                     client_fd
                 );
             }
 
             /*
-             * server_fd değilse:
-             * mevcut clientlardan biri veri göndermiştir.
+             * Listening socket değil:
+             * mevcut bir client veri gönderdi.
              */
             else {
 
+                /*
+                 * current_fd hangi client'a ait?
+                 */
+                int client_index = -1;
+
+                for (int j = 0; j < MAX_CLIENTS; j++) {
+
+                    if (
+                        clients[j].active == 1 &&
+                        clients[j].fd == current_fd
+                    ) {
+
+                        client_index = j;
+                        break;
+                    }
+                }
+
+                if (client_index == -1) {
+
+                    printf(
+                        "Unknown client fd: %d\n",
+                        current_fd
+                    );
+
+                    continue;
+                }
+
+                /*
+                 * Client'tan veri oku.
+                 */
                 n = recv(
                     current_fd,
                     message,
@@ -329,16 +279,32 @@ int main(void)
                 );
 
                 if (n < 0) {
+
                     perror("recv");
                     continue;
                 }
 
+                /*
+                 * TCP bağlantısı kapandı.
+                 */
                 if (n == 0) {
 
-                    printf(
-                        "Client fd %d disconnected.\n",
-                        current_fd
-                    );
+                    if (clients[client_index].logged_in) {
+
+                        printf(
+                            "Client disconnected: %s [%d], fd=%d\n",
+                            clients[client_index].username,
+                            clients[client_index].user_id,
+                            current_fd
+                        );
+                    }
+                    else {
+
+                        printf(
+                            "Client disconnected before login: fd=%d\n",
+                            current_fd
+                        );
+                    }
 
                     epoll_ctl(
                         epoll_fd,
@@ -347,6 +313,12 @@ int main(void)
                         NULL
                     );
 
+                    clients[client_index].active = 0;
+                    clients[client_index].logged_in = 0;
+                    clients[client_index].fd = -1;
+                    clients[client_index].user_id = -1;
+                    clients[client_index].username[0] = '\0';
+
                     close(current_fd);
 
                     continue;
@@ -354,11 +326,155 @@ int main(void)
 
                 message[n] = '\0';
 
-                printf(
-                    "fd %d: %s",
-                    current_fd,
-                    message
-                );
+                /*
+                 * LOGIN AŞAMASI
+                 */
+                if (clients[client_index].logged_in == 0) {
+
+                    strncpy(
+                        clients[client_index].username,
+                        message,
+                        sizeof(clients[client_index].username) - 1
+                    );
+
+                    clients[client_index].username[
+                        sizeof(clients[client_index].username) - 1
+                    ] = '\0';
+
+                    /*
+                     * Client fgets() kullandığı için
+                     * sondaki newline'ı temizle.
+                     */
+                    clients[client_index].username[
+                        strcspn(
+                            clients[client_index].username,
+                            "\r\n"
+                        )
+                    ] = '\0';
+
+                    printf(
+                        "Username received from fd %d: %s\n",
+                        current_fd,
+                        clients[client_index].username
+                    );
+
+                    FILE *users_file = fopen(
+                        "users.db",
+                        "a+"
+                    );
+
+                    if (users_file == NULL) {
+
+                        perror("fopen");
+                        continue;
+                    }
+
+                    int found_user_id = -1;
+                    int max_id = 0;
+
+                    rewind(users_file);
+
+                    while (
+                        fgets(
+                            line,
+                            sizeof(line),
+                            users_file
+                        ) != NULL
+                    ) {
+
+                        int file_id;
+                        char file_username[32];
+
+                        if (sscanf(
+                                line,
+                                "%d|%31s",
+                                &file_id,
+                                file_username
+                            ) == 2) {
+
+                            if (file_id > max_id) {
+                                max_id = file_id;
+                            }
+
+                            if (
+                                strcmp(
+                                    file_username,
+                                    clients[client_index].username
+                                ) == 0
+                            ) {
+
+                                found_user_id = file_id;
+                            }
+                        }
+                    }
+
+                    /*
+                     * Kullanıcı yoksa yeni ID oluştur.
+                     */
+                    if (found_user_id == -1) {
+
+                        found_user_id = max_id + 1;
+
+                        fprintf(
+                            users_file,
+                            "%d|%s\n",
+                            found_user_id,
+                            clients[client_index].username
+                        );
+
+                        printf(
+                            "New user created: %s, ID=%d\n",
+                            clients[client_index].username,
+                            found_user_id
+                        );
+                    }
+                    else {
+
+                        printf(
+                            "Existing user found: %s, ID=%d\n",
+                            clients[client_index].username,
+                            found_user_id
+                        );
+                    }
+
+                    clients[client_index].user_id =
+                        found_user_id;
+
+                    clients[client_index].logged_in = 1;
+
+                    fclose(users_file);
+
+                    snprintf(
+                        response,
+                        sizeof(response),
+                        "Login successful. User ID: %d\n",
+                        clients[client_index].user_id
+                    );
+
+                    if (send(
+                            current_fd,
+                            response,
+                            strlen(response),
+                            0
+                        ) < 0) {
+
+                        perror("send");
+                    }
+                }
+
+                /*
+                 * LOGIN TAMAMLANMIŞ:
+                 * gelen veri artık chat mesajıdır.
+                 */
+                else {
+
+                    printf(
+                        "%s [%d]: %s",
+                        clients[client_index].username,
+                        clients[client_index].user_id,
+                        message
+                    );
+                }
             }
         }
     }
