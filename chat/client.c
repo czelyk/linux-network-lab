@@ -9,7 +9,7 @@
 #include <poll.h>
 
 #define PORT 5001
-#define SERVER_IP "127.0.0.1"
+#define SERVER_IP "172.20.10.13"
 
 static int send_all(
     int fd,
